@@ -1,0 +1,550 @@
+import cv2
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+video_path = Path("video.mp4")
+
+target_rgb = np.uint8([[[236, 225, 70]]])
+h_tol, s_tol, v_tol = 32, 100, 120
+min_area = 100
+kernel_open = (5, 5)
+max_jump_px = 220
+search_radius = 180
+ERASER_THICKNESS = 36
+
+KEY_LEFT = 2424832
+KEY_RIGHT = 2555904
+KEY_LEFT_ALT = 81
+KEY_RIGHT_ALT = 83
+
+def rgb_to_hsv_bounds(target_rgb, h_tol=20, s_tol=20, v_tol=20):
+    hsv = cv2.cvtColor(target_rgb, cv2.COLOR_RGB2HSV)[0, 0, :].astype(int)
+    h, s, v = hsv
+    low_h, high_h = h - h_tol, h + h_tol
+    low_s, high_s = max(0, s - s_tol), min(255, s + s_tol)
+    low_v, high_v = max(0, v - v_tol), min(255, v + v_tol)
+    ranges = []
+    if 0 <= low_h <= high_h <= 179:
+        ranges.append((np.array([low_h, low_s, low_v], np.uint8),
+                       np.array([high_h, high_s, high_v], np.uint8)))
+    else:
+        low_h_mod = (low_h + 180) % 180
+        high_h_mod = (high_h + 180) % 180
+        ranges.append((np.array([low_h_mod, low_s, low_v], np.uint8),
+                       np.array([179, high_s, high_v], np.uint8)))
+        ranges.append((np.array([0, low_s, low_v], np.uint8),
+                       np.array([high_h_mod, high_s, high_v], np.uint8)))
+    return ranges
+
+def build_color_mask(frame_bgr, ranges_hsv, kernel_open=(3, 3), erase_mask=None):
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask_total = None
+    for low, high in ranges_hsv:
+        m = cv2.inRange(hsv, low, high)
+        mask_total = m if mask_total is None else cv2.bitwise_or(mask_total, m)
+    if erase_mask is not None:
+        mask_total = cv2.bitwise_and(mask_total, cv2.bitwise_not(erase_mask))
+    if kernel_open:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_open)
+        mask_total = cv2.morphologyEx(mask_total, cv2.MORPH_OPEN, k)
+    return mask_total
+
+def find_color_components(frame_bgr, ranges_hsv, min_area=100, kernel_open=(3, 3), erase_mask=None):
+    mask = build_color_mask(frame_bgr, ranges_hsv, kernel_open, erase_mask)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    comps = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area <= min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        M = cv2.moments(c)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
+        else:
+            cx = int(x + w / 2); cy = int(y + h / 2)
+        comps.append({"bbox": (x, y, w, h), "area": area, "centroid": (cx, cy)})
+    comps.sort(key=lambda d: d["area"], reverse=True)
+    return comps
+
+def find_components_in_roi(frame_bgr, ranges_hsv, center, radius, min_area=100, kernel_open=(3, 3), erase_mask=None):
+    H, W = frame_bgr.shape[:2]
+    cx, cy = int(center[0]), int(center[1])
+    x1, y1 = max(0, cx - radius), max(0, cy - radius)
+    x2, y2 = min(W, cx + radius), min(H, cy + radius)
+    roi = frame_bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        return [], (x1, y1, x2, y2)
+    roi_mask = erase_mask[y1:y2, x1:x2] if erase_mask is not None else None
+    comps_local = find_color_components(roi, ranges_hsv, min_area, kernel_open, roi_mask)
+    for c in comps_local:
+        x, y, w, h = c["bbox"]
+        c["bbox"] = (x + x1, y + y1, w, h)
+        cx0, cy0 = c["centroid"]; c["centroid"] = (cx0 + x1, cy0 + y1)
+    return comps_local, (x1, y1, x2, y2)
+
+def box_center(box):
+    x, y, w, h = box
+    return (int(x + w / 2), int(y + h / 2))
+
+def point_in_box(pt, box):
+    x, y, w, h = box
+    return (x <= pt[0] <= x + w) and (y <= pt[1] <= y + h)
+
+class EraseManager:
+    def __init__(self, width, height):
+        self.w, self.h = width, height
+        self.masks = {}
+        self.current_frame = 0
+        self.is_stroking = False
+        self.last_pt = None
+        self.dirty = False
+
+    def set_frame(self, idx):
+        self.current_frame = idx
+
+    def _ensure_mask(self):
+        if self.current_frame not in self.masks:
+            self.masks[self.current_frame] = np.zeros((self.h, self.w), np.uint8)
+        return self.masks[self.current_frame]
+
+    def start(self, x, y):
+        self.is_stroking = True
+        self.last_pt = (x, y)
+        mask = self._ensure_mask()
+        cv2.circle(mask, (x, y), ERASER_THICKNESS // 2, 255, -1, cv2.LINE_AA)
+        self.dirty = True
+
+    def add_point(self, x, y):
+        if not self.is_stroking: return
+        mask = self._ensure_mask()
+        cv2.line(mask, self.last_pt, (x, y), 255, ERASER_THICKNESS, cv2.LINE_AA)
+        self.last_pt = (x, y); self.dirty = True
+
+    def end(self):
+        self.is_stroking = False
+        self.last_pt = None
+
+    def cancel_poly(self):
+        self.is_stroking = False
+        self.last_pt = None
+
+    def get_mask(self, idx):
+        return self.masks.get(idx, None)
+
+def compute_angle_deg(center_xy, p2, v0_unit):
+    v = np.array(center_xy, np.float32) - np.array(p2, np.float32)
+    n = np.linalg.norm(v)
+    if n == 0: return 0.0
+    v_unit = v / n
+    dot = float(np.clip(np.dot(v0_unit, v_unit), -1.0, 1.0))
+    ang = np.degrees(np.arccos(dot))
+    cross = v0_unit[0]*v_unit[1] - v0_unit[1]*v_unit[0]
+    if cross < 0: ang = -ang
+    return ang
+
+def track_compute(frame, idx, prev_center, velocity, dt, ranges_hsv, p2, v0_unit, erase_mask):
+    x_pred = prev_center + velocity * dt
+    comps_roi, _ = find_components_in_roi(frame, ranges_hsv, x_pred, search_radius,
+                                          min_area, kernel_open, erase_mask)
+    comps = comps_roi
+    if not comps:
+        comps = find_color_components(frame, ranges_hsv, min_area, kernel_open, erase_mask)
+    chosen = None
+    if comps:
+        dists = [(np.hypot(c["centroid"][0]-x_pred[0], c["centroid"][1]-x_pred[1]), c) for c in comps]
+        dists.sort(key=lambda t: t[0])
+        if dists[0][0] <= max_jump_px:
+            chosen = dists[0][1]
+    if chosen:
+        (x, y, w, h) = chosen["bbox"]
+        cx, cy = chosen["centroid"]
+        current_center = np.array([float(cx), float(cy)], np.float32)
+        new_vel = (current_center - prev_center) / max(dt, 1e-6)
+        new_prev = current_center.copy()
+        angle_deg = compute_angle_deg(current_center, p2, v0_unit)
+        return (float(cx), float(cy)), (int(x), int(y), int(w), int(h)), new_prev, new_vel, float(angle_deg)
+    else:
+        new_prev = x_pred.copy()
+        new_vel = velocity.copy()
+        return None, None, new_prev, new_vel, np.nan
+
+def draw_from_cache(frame, center, bbox, p2):
+    disp = frame.copy()
+    if center is not None:
+        cx, cy = int(center[0]), int(center[1])
+        cv2.circle(disp, (cx, cy), 5, (0, 255, 255), -1)
+        cv2.circle(disp, tuple(map(int, p2)), 5, (0, 0, 255), -1)
+        cv2.line(disp, tuple(map(int, p2)), (cx, cy), (0, 255, 0), 2)
+        if bbox is not None:
+            x, y, w, h = bbox
+            cv2.rectangle(disp, (x, y), (x+w, y+h), (0, 140, 255), 2)
+    return disp
+
+def open_video_writer_with_fallback(out_base_path: Path, fps: float, size_wh):
+    W, H = size_wh
+    trials = [
+        (('m','p','4','v'), out_base_path.with_suffix('.mp4')),
+        (('a','v','c','1'), out_base_path.with_suffix('.mp4')),
+        (('X','V','I','D'), out_base_path.with_suffix('.avi')),
+        (('M','J','P','G'), out_base_path.with_suffix('.avi')),
+    ]
+    for fourcc_chars, path in trials:
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*fourcc_chars), fps, (W, H))
+        if writer.isOpened():
+            return writer, path
+        else:
+            writer.release()
+    raise RuntimeError("Unable to open VideoWriter.")
+
+def save_table_with_fallback(df: pd.DataFrame, excel_path: Path):
+    try:
+        df.to_excel(excel_path, index=False)
+        return str(excel_path), None
+    except Exception as e:
+        csv_path = excel_path.with_suffix('.csv')
+        try:
+            df.to_csv(csv_path, index=False)
+            return str(csv_path), f"Excel failed: {e}. Saved CSV."
+        except Exception as e2:
+            return None, f"Table save failed: {e2}"
+
+def main():
+    cv2.setUseOptimized(True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open video.")
+    ok, first_frame = cap.read()
+    if not ok:
+        raise RuntimeError("Cannot read first frame.")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    dt = 1.0 / fps
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    h_frame, w_frame = first_frame.shape[:2]
+
+    ranges_hsv = rgb_to_hsv_bounds(target_rgb, h_tol, s_tol, v_tol)
+
+    comps_first = find_color_components(first_frame, ranges_hsv, min_area, kernel_open)
+    bboxes_first = [c["bbox"] for c in comps_first]
+    state = {"bbox": None, "p2": None}
+
+    def on_mouse_setup(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if state["bbox"] is None:
+                for b in bboxes_first:
+                    if point_in_box((x, y), b):
+                        state["bbox"] = b; break
+            elif state["p2"] is None:
+                state["p2"] = (x, y)
+
+    cv2.namedWindow("Setup", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("Setup", on_mouse_setup)
+
+    print("Seleziona il marker e poi il punto fisso. Premi 's' per continuare.")
+
+    while True:
+        frame = first_frame.copy()
+        for b in bboxes_first:
+            x, y, w, h = b
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+        if state["bbox"] is not None:
+            x, y, w, h = state["bbox"]
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 2)
+        if state["p2"] is not None:
+            cv2.circle(frame, state["p2"], 5, (0, 0, 255), -1)
+        cv2.imshow("Setup", frame)
+        if cv2.waitKeyEx(30) == ord("s") and state["bbox"] and state["p2"]:
+            break
+    cv2.destroyWindow("Setup")
+
+    x0, y0, w0, h0 = state["bbox"]
+    c0 = np.array(box_center((x0, y0, w0, h0)), np.float32)
+    p2 = np.array(state["p2"], np.float32)
+    v0 = c0 - p2
+    v0_unit = v0 / (np.linalg.norm(v0) if np.linalg.norm(v0) != 0 else 1.0)
+
+    zero_idx = 0
+    cv2.namedWindow("ZeroSel", cv2.WINDOW_NORMAL)
+    browse_idx = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, browse_idx)
+
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            browse_idx = max(0, min(total_frames - 1, browse_idx))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, browse_idx)
+            ok, fr = cap.read()
+            if not ok:
+                break
+        disp = fr.copy()
+        cv2.circle(disp, tuple(map(int, p2)), 5, (0, 0, 255), -1)
+        tsec = browse_idx / fps
+        label = f"Frame {browse_idx+1}/{total_frames}  t={tsec:.2f}s  0° @ {zero_idx+1}"
+        cv2.putText(disp, label, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+        cv2.putText(disp, label, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 1)
+        cv2.imshow("ZeroSel", disp)
+
+        key = cv2.waitKeyEx(0)
+        if key in (27, ord('q')):
+            break
+        elif key in (KEY_LEFT, ord('j'), ord('J')):
+            browse_idx = max(0, browse_idx - 1); cap.set(cv2.CAP_PROP_POS_FRAMES, browse_idx)
+        elif key in (KEY_RIGHT, ord('l'), ord('L')):
+            browse_idx = min(total_frames-1, browse_idx + 1); cap.set(cv2.CAP_PROP_POS_FRAMES, browse_idx)
+        elif key in (ord('a'), ord('A')):
+            browse_idx = max(0, browse_idx - 5); cap.set(cv2.CAP_PROP_POS_FRAMES, browse_idx)
+        elif key in (ord('d'), ord('D')):
+            browse_idx = min(total_frames-1, browse_idx + 5); cap.set(cv2.CAP_PROP_POS_FRAMES, browse_idx)
+        elif key in (ord('w'), ord('W')):
+            browse_idx = max(0, browse_idx - 30); cap.set(cv2.CAP_PROP_POS_FRAMES, browse_idx)
+        elif key in (ord('s'), ord('S')):
+            break
+        elif key in (ord('z'), ord('Z')):
+            zero_idx = browse_idx
+        elif key == 13:
+            break
+
+    cv2.destroyWindow("ZeroSel")
+
+    centers = [None] * total_frames
+    bboxes  = [None] * total_frames
+    angles  = [np.nan] * total_frames
+
+    erase = EraseManager(w_frame, h_frame)
+    paused = False
+    erase_mode = False
+    frame_idx = 0
+    current_frame = first_frame
+    prev_center = c0.copy()
+    velocity = np.zeros(2, np.float32)
+    end_reached = False
+    end_notified = False
+
+    def seek_to(idx):
+        idx = max(0, min(total_frames-1, idx))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, fr = cap.read()
+        return idx, ok, fr
+
+    def get_state_for_idx(idx):
+        if idx > 0 and centers[idx-1] is not None:
+            prev = np.array(centers[idx-1], np.float32)
+            if idx > 1 and centers[idx-2] is not None:
+                vel = (np.array(centers[idx-1], np.float32) - np.array(centers[idx-2], np.float32)) / max(dt, 1e-6)
+            else:
+                vel = np.zeros(2, np.float32)
+        else:
+            prev = c0.copy(); vel = np.zeros(2, np.float32)
+        return prev, vel
+
+    def invalidate_from(idx):
+        for i in range(idx, total_frames):
+            centers[i] = None; bboxes[i] = None; angles[i] = np.nan
+
+    def on_mouse_erase(event, x, y, flags, param):
+        if erase_mode:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                erase.start(x, y)
+            elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+                erase.add_point(x, y)
+            elif event == cv2.EVENT_LBUTTONUP:
+                erase.add_point(x, y); erase.end()
+
+    cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("Tracking", on_mouse_erase)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    frame_idx = 0
+
+    while True:
+        if not paused:
+            ok, frame = cap.read()
+            if not ok:
+                if not end_reached:
+                    end_reached = True; paused = True
+                    frame_idx = total_frames - 1
+                    _idx, ok2, fr2 = seek_to(frame_idx)
+                    if ok2: current_frame = fr2
+                    if not end_notified:
+                        end_notified = True
+                continue
+
+            current_frame = frame
+            erase.set_frame(frame_idx)
+
+            if centers[frame_idx] is None:
+                mask = erase.get_mask(frame_idx)
+                prev_center, velocity = get_state_for_idx(frame_idx)
+                c, bb, prev_center, velocity, ang = track_compute(
+                    frame, frame_idx, prev_center, velocity, dt, ranges_hsv, p2, v0_unit, mask
+                )
+                centers[frame_idx] = c; bboxes[frame_idx] = bb; angles[frame_idx] = ang
+            else:
+                c = centers[frame_idx]
+                if c is not None and frame_idx > 0 and centers[frame_idx-1] is not None:
+                    velocity = (np.array(c, np.float32) - np.array(centers[frame_idx-1], np.float32)) / max(dt, 1e-6)
+                if c is not None:
+                    prev_center = np.array(c, np.float32)
+
+            disp = draw_from_cache(current_frame, centers[frame_idx], bboxes[frame_idx], p2)
+            cv2.imshow("Tracking", disp)
+
+            frame_idx += 1
+            if frame_idx >= total_frames:
+                frame_idx = total_frames - 1; paused = True
+                if not end_notified:
+                    end_notified = True
+
+        else:
+            erase.set_frame(frame_idx)
+
+            if erase_mode and erase.dirty:
+                prev_tmp, vel_tmp = get_state_for_idx(frame_idx)
+                mask = erase.get_mask(frame_idx)
+                frame_idx, ok, current_frame = seek_to(frame_idx)
+                if not ok: break
+                c, bb, _p, _v, ang = track_compute(
+                    current_frame, frame_idx, prev_tmp, vel_tmp, dt, ranges_hsv, p2, v0_unit, mask
+                )
+                centers[frame_idx] = c; bboxes[frame_idx] = bb; angles[frame_idx] = ang
+                erase.dirty = False
+
+            disp = draw_from_cache(current_frame, centers[frame_idx], bboxes[frame_idx], p2)
+            cv2.imshow("Tracking", disp)
+
+        key = cv2.waitKeyEx(15)
+
+        if key in (27, ord('q')):
+            cap.release(); cv2.destroyAllWindows(); return
+
+        elif key == ord(' '):
+            paused = not paused
+            if not paused:
+                frame_idx, ok, current_frame = seek_to(frame_idx)
+                if not ok:
+                    paused = True; frame_idx = total_frames - 1
+
+        elif key == ord('e'):
+            erase_mode = not erase_mode
+            if not erase_mode: erase.cancel_poly()
+
+        elif key == 13:
+            if erase_mode:
+                erase.end()
+                if frame_idx + 1 < total_frames:
+                    invalidate_from(frame_idx + 1)
+                next_idx = min(total_frames - 1, frame_idx + 1)
+                frame_idx, ok, current_frame = seek_to(next_idx)
+                if not ok: frame_idx = total_frames - 1
+                erase.set_frame(frame_idx)
+
+        elif key in (KEY_LEFT, KEY_LEFT_ALT, ord('a')) and paused:
+            frame_idx = max(0, frame_idx - 1)
+            frame_idx, ok, current_frame = seek_to(frame_idx)
+
+        elif key in (KEY_RIGHT, KEY_RIGHT_ALT, ord('d')) and paused:
+            frame_idx = min(total_frames - 1, frame_idx + 1)
+            frame_idx, ok, current_frame = seek_to(frame_idx)
+
+        elif key == ord('f'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    try:
+        cap1 = cv2.VideoCapture(str(video_path))
+        if not cap1.isOpened():
+            raise RuntimeError("Cannot reopen video.")
+        fps = cap1.get(cv2.CAP_PROP_FPS) or fps
+        dt = 1.0 / fps
+        total_frames = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        def get_state_for_idx_final(idx):
+            if idx > 0 and centers[idx-1] is not None:
+                prev = np.array(centers[idx-1], np.float32)
+                if idx > 1 and centers[idx-2] is not None:
+                    vel = (np.array(centers[idx-1], np.float32) - np.array(centers[idx-2], np.float32)) / max(dt, 1e-6)
+                else:
+                    vel = np.zeros(2, np.float32)
+            else:
+                prev = c0.copy(); vel = np.zeros(2, np.float32)
+            return prev, vel
+
+        def fill_missing_from(start_idx):
+            cap1.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+            idx = start_idx
+            prev, vel = get_state_for_idx_final(start_idx)
+            while idx < total_frames:
+                ok, frame = cap1.read()
+                if not ok: break
+                if centers[idx] is None:
+                    mask = erase.get_mask(idx)
+                    c, bb, prev, vel, ang = track_compute(
+                        frame, idx, prev, vel, dt, ranges_hsv, p2, v0_unit, mask
+                    )
+                    centers[idx] = c; bboxes[idx] = bb; angles[idx] = ang
+                else:
+                    c = centers[idx]
+                    if c is not None and idx > 0 and centers[idx-1] is not None:
+                        vel = (np.array(c, np.float32) - np.array(centers[idx-1], np.float32)) / max(dt, 1e-6)
+                    if c is not None: prev = np.array(c, np.float32)
+                idx += 1
+
+        i = 0
+        while i < total_frames:
+            if centers[i] is None:
+                fill_missing_from(i)
+                while i < total_frames and centers[i] is not None:
+                    i += 1
+            else:
+                i += 1
+        cap1.release()
+
+        zi = int(np.clip(zero_idx, 0, total_frames - 1))
+        angle_offset = angles[zi] if np.isfinite(angles[zi]) else 0.0
+        angles = [(a - angle_offset) if np.isfinite(a) else np.nan for a in angles]
+
+        arr = np.array(angles, dtype=float)
+        angle_max = np.nanmax(np.abs(arr)) if not np.all(np.isnan(arr)) else 1.0
+        if not np.isfinite(angle_max) or angle_max == 0: angle_max = 1.0
+
+        out_base = video_path.parent / f"{video_path.stem}_tracked"
+        writer, out_video_path = open_video_writer_with_fallback(out_base, fps, (w_frame, h_frame))
+        cap2 = cv2.VideoCapture(str(video_path))
+        if not cap2.isOpened():
+            writer.release()
+            raise RuntimeError("Cannot reopen for writing.")
+
+        for idx in range(total_frames):
+            ok, frame = cap2.read()
+            if not ok: break
+            ang = angles[idx]
+            if centers[idx] is not None and np.isfinite(ang):
+                perc = (abs(ang) / angle_max) * 100.0
+                txt = f"{perc:5.1f}%  {ang:+6.2f}°"
+                cv2.putText(frame, txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+                cv2.putText(frame, txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 1)
+            writer.write(frame)
+
+        cap2.release()
+        writer.release()
+
+        percents = [(abs(a)/angle_max*100.0) if np.isfinite(a) else np.nan for a in angles]
+        times = [i/fps for i in range(total_frames)]
+        df = pd.DataFrame({"Time (s)": times, "Angle [deg]": angles, "Excursion (%)": percents})
+        excel_path = video_path.with_suffix(".xlsx")
+        table_path, warn = save_table_with_fallback(df, excel_path)
+
+        print(f"Video saved: {out_video_path}")
+        if warn:
+            print(warn)
+        print(f"Table saved: {table_path}")
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
